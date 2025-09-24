@@ -13,6 +13,7 @@ class PureVectorSearchEngine {
     // 稀疏倒排索引与文档范数（受Queryable启发的高效索引结构）
     this.invertedIndex = new Map(); // term -> Array<{ id: string, w: number }> (文档归一化权重)
     this.docNorms = new Map();      // docId -> number (文档向量范数)
+    this.dbPromise = null;          // IndexedDB 连接Promise
   }
 
   async initialize() {
@@ -28,20 +29,35 @@ class PureVectorSearchEngine {
     try {
       console.log('开始初始化纯向量搜索引擎...');
       this.initProgress.status = 'initializing';
-      
-      // 获取所有书签
+
+      // 获取所有书签并计算签名
       const bookmarks = await this.getAllBookmarks();
       this.initProgress.total = bookmarks.length;
+
+      const signature = await this.computeBookmarksSignature(bookmarks);
+
+      // 先尝试从本地缓存加载索引
+      const loaded = await this.loadIndex(signature);
+      if (loaded) {
+        this.isInitialized = true;
+        this.initProgress.status = 'completed';
+        this.initProgress.current = this.initProgress.total;
+        console.log('已从本地缓存加载索引，跳过重建');
+        return true;
+      }
+
+      // 未命中缓存，则构建词汇表与倒排索引
       this.initProgress.status = 'fetching_content';
-      
-      // 构建词汇表和计算TF-IDF
       await this.buildVocabularyAndVectors(bookmarks);
-      
+
+      // 构建完成后保存索引
+      await this.saveIndex(signature);
+
       this.isInitialized = true;
       this.initProgress.status = 'completed';
       this.initProgress.current = this.initProgress.total;
       console.log(`纯向量搜索引擎初始化完成，处理了 ${bookmarks.length} 个书签`);
-      
+
       return true;
     } catch (error) {
       console.error('初始化失败:', error);
@@ -75,6 +91,204 @@ class PureVectorSearchEngine {
         resolve(bookmarks);
       });
     });
+  }
+
+  // ======= 持久化：书签签名、IndexedDB 存取 =======
+  async computeBookmarksSignature(bookmarks) {
+    // 仅用必要字段生成稳定签名
+    const payload = bookmarks
+      .map(b => `${b.id}|${b.title}|${b.url}|${b.dateAdded || ''}`)
+      .sort() // 排序确保顺序无关
+      .join('\n');
+    return this.hashString(payload);
+  }
+
+  hashString(str) {
+    // FNV-1a 32-bit hash
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+      hash >>>= 0;
+    }
+    return ('0000000' + hash.toString(16)).slice(-8);
+  }
+
+  async openDatabase() {
+    if (this.dbPromise) return this.dbPromise;
+    this.dbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open('BookmarkSearchDB', 1);
+      request.onupgradeneeded = (event) => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains('meta')) {
+          const store = db.createObjectStore('meta', { keyPath: 'key' });
+          store.createIndex('key', 'key', { unique: true });
+        }
+        if (!db.objectStoreNames.contains('idf')) {
+          db.createObjectStore('idf', { keyPath: 'term' });
+        }
+        if (!db.objectStoreNames.contains('norms')) {
+          db.createObjectStore('norms', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('docs')) {
+          db.createObjectStore('docs', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('inv')) {
+          db.createObjectStore('inv', { keyPath: 'term' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    return this.dbPromise;
+  }
+
+  idbReq(req) {
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async clearStores(db) {
+    const tx = db.transaction(['idf', 'norms', 'docs', 'inv'], 'readwrite');
+    await Promise.all([
+      this.idbReq(tx.objectStore('idf').clear()),
+      this.idbReq(tx.objectStore('norms').clear()),
+      this.idbReq(tx.objectStore('docs').clear()),
+      this.idbReq(tx.objectStore('inv').clear())
+    ]);
+    await new Promise(resolve => {
+      tx.oncomplete = () => resolve();
+    });
+  }
+
+  async loadIndex(signature) {
+    try {
+      const db = await this.openDatabase();
+
+      // 校验签名
+      const metaTx = db.transaction('meta', 'readonly');
+      const meta = await this.idbReq(metaTx.objectStore('meta').get('meta'));
+      if (!meta || meta.signature !== signature) {
+        return false;
+      }
+
+      console.log('发现匹配的本地索引，开始加载到内存...');
+
+      // 读取各存储
+      const readAll = async (storeName) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        const res = await this.idbReq(req);
+        return res || [];
+      };
+
+      const [idfRows, normRows, docRows, invRows] = await Promise.all([
+        readAll('idf'),
+        readAll('norms'),
+        readAll('docs'),
+        readAll('inv')
+      ]);
+
+      // 重建内存结构
+      this.idfValues = new Map();
+      for (const row of idfRows) {
+        this.idfValues.set(row.term, row.idf);
+      }
+
+      this.docNorms = new Map();
+      for (const row of normRows) {
+        this.docNorms.set(row.id, row.norm);
+      }
+
+      this.bookmarkData = new Map();
+      for (const row of docRows) {
+        this.bookmarkData.set(row.id, { id: row.id, title: row.title, url: row.url });
+      }
+
+      this.invertedIndex = new Map();
+      for (const row of invRows) {
+        this.invertedIndex.set(row.term, row.posting);
+      }
+
+      console.log('索引加载完成');
+      return true;
+    } catch (e) {
+      console.warn('加载本地索引失败，回退到重建:', e && e.message);
+      return false;
+    }
+  }
+
+  async saveIndex(signature) {
+    try {
+      const db = await this.openDatabase();
+
+      // 先清空旧数据
+      await this.clearStores(db);
+
+      // 批量写入
+      // meta
+      {
+        const tx = db.transaction('meta', 'readwrite');
+        await this.idbReq(tx.objectStore('meta').put({
+          key: 'meta',
+          signature,
+          createdAt: Date.now(),
+          stats: {
+            docCount: this.bookmarkData.size,
+            idfCount: this.idfValues.size,
+            termCount: this.invertedIndex.size
+          }
+        }));
+        await new Promise(resolve => { tx.oncomplete = () => resolve(); });
+      }
+
+      // idf
+      {
+        const tx = db.transaction('idf', 'readwrite');
+        const store = tx.objectStore('idf');
+        for (const [term, idf] of this.idfValues.entries()) {
+          store.put({ term, idf });
+        }
+        await new Promise(resolve => { tx.oncomplete = () => resolve(); });
+      }
+
+      // norms
+      {
+        const tx = db.transaction('norms', 'readwrite');
+        const store = tx.objectStore('norms');
+        for (const [id, norm] of this.docNorms.entries()) {
+          store.put({ id, norm });
+        }
+        await new Promise(resolve => { tx.oncomplete = () => resolve(); });
+      }
+
+      // docs（仅保存最小必要字段）
+      {
+        const tx = db.transaction('docs', 'readwrite');
+        const store = tx.objectStore('docs');
+        for (const [id, doc] of this.bookmarkData.entries()) {
+          store.put({ id, title: doc.title || '', url: doc.url || '' });
+        }
+        await new Promise(resolve => { tx.oncomplete = () => resolve(); });
+      }
+
+      // inv
+      {
+        const tx = db.transaction('inv', 'readwrite');
+        const store = tx.objectStore('inv');
+        for (const [term, posting] of this.invertedIndex.entries()) {
+          store.put({ term, posting });
+        }
+        await new Promise(resolve => { tx.oncomplete = () => resolve(); });
+      }
+
+      console.log('索引已保存到本地缓存');
+    } catch (e) {
+      console.warn('保存索引失败（不影响搜索功能）:', e && e.message);
+    }
   }
 
   // 完全基于模型的文本预处理：纯数学方法，无预定义规则
