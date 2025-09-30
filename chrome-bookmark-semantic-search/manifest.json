@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "智能书签搜索",
   "version": "1.0.0",
-  "description": "基于语义理解的本地书签搜索插件",
+  "description": "基于 CLIP 语义理解的智能书签搜索 - 真正理解查询意图",
   
   "permissions": [
     "bookmarks",
@@ -16,7 +16,8 @@
   ],
   
   "background": {
-    "service_worker": "background_pure_vector.js"
+    "service_worker": "background_semantic.js",
+    "type": "module"
   },
   
   "content_scripts": [

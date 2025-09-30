@@ -35,18 +35,33 @@ class PureVectorSearchEngine {
       this.initProgress.total = bookmarks.length;
 
       const signature = await this.computeBookmarksSignature(bookmarks);
+      console.log(`当前书签签名: ${signature}, 共 ${bookmarks.length} 个书签`);
 
       // 先尝试从本地缓存加载索引
-      const loaded = await this.loadIndex(signature);
-      if (loaded) {
+      const loadResult = await this.loadIndex(signature, bookmarks);
+      if (loadResult.loaded) {
         this.isInitialized = true;
         this.initProgress.status = 'completed';
         this.initProgress.current = this.initProgress.total;
-        console.log('已从本地缓存加载索引，跳过重建');
+        console.log('✅ 已从本地缓存加载索引，跳过重建');
         return true;
       }
 
-      // 未命中缓存，则构建词汇表与倒排索引
+      // 检查是否可以增量更新
+      if (loadResult.canIncremental) {
+        console.log(`🔄 检测到增量变化，新增: ${loadResult.added.length}, 删除: ${loadResult.removed.length}`);
+        await this.incrementalUpdate(loadResult.added, loadResult.removed, bookmarks);
+        await this.saveIndex(signature);
+        
+        this.isInitialized = true;
+        this.initProgress.status = 'completed';
+        this.initProgress.current = this.initProgress.total;
+        console.log(`✅ 增量更新完成`);
+        return true;
+      }
+
+      // 完全重建索引
+      console.log('🔨 执行完整索引重建...');
       this.initProgress.status = 'fetching_content';
       await this.buildVocabularyAndVectors(bookmarks);
 
@@ -56,7 +71,7 @@ class PureVectorSearchEngine {
       this.isInitialized = true;
       this.initProgress.status = 'completed';
       this.initProgress.current = this.initProgress.total;
-      console.log(`纯向量搜索引擎初始化完成，处理了 ${bookmarks.length} 个书签`);
+      console.log(`✅ 纯向量搜索引擎初始化完成，处理了 ${bookmarks.length} 个书签`);
 
       return true;
     } catch (error) {
@@ -95,12 +110,23 @@ class PureVectorSearchEngine {
 
   // ======= 持久化：书签签名、IndexedDB 存取 =======
   async computeBookmarksSignature(bookmarks) {
-    // 仅用必要字段生成稳定签名
+    // 仅用稳定字段生成签名（排除dateAdded等易变字段）
     const payload = bookmarks
-      .map(b => `${b.id}|${b.title}|${b.url}|${b.dateAdded || ''}`)
+      .map(b => `${b.id}|${b.title}|${b.url}`)
       .sort() // 排序确保顺序无关
       .join('\n');
     return this.hashString(payload);
+  }
+
+  // 检测书签集合的变化
+  detectBookmarkChanges(currentBookmarks, cachedBookmarkIds) {
+    const currentIds = new Set(currentBookmarks.map(b => b.id));
+    const cachedIds = new Set(cachedBookmarkIds);
+
+    const added = currentBookmarks.filter(b => !cachedIds.has(b.id));
+    const removed = [...cachedIds].filter(id => !currentIds.has(id));
+
+    return { added, removed };
   }
 
   hashString(str) {
@@ -163,61 +189,91 @@ class PureVectorSearchEngine {
     });
   }
 
-  async loadIndex(signature) {
+  async loadIndex(signature, currentBookmarks) {
     try {
       const db = await this.openDatabase();
 
-      // 校验签名
+      // 读取元数据
       const metaTx = db.transaction('meta', 'readonly');
       const meta = await this.idbReq(metaTx.objectStore('meta').get('meta'));
-      if (!meta || meta.signature !== signature) {
-        return false;
+      
+      if (!meta) {
+        console.log('⚠️ 未找到缓存的索引');
+        return { loaded: false, canIncremental: false };
       }
 
-      console.log('发现匹配的本地索引，开始加载到内存...');
+      console.log(`📋 缓存签名: ${meta.signature}, 当前签名: ${signature}`);
 
-      // 读取各存储
-      const readAll = async (storeName) => {
-        const tx = db.transaction(storeName, 'readonly');
-        const store = tx.objectStore(storeName);
-        const req = store.getAll();
-        const res = await this.idbReq(req);
-        return res || [];
-      };
-
-      const [idfRows, normRows, docRows, invRows] = await Promise.all([
-        readAll('idf'),
-        readAll('norms'),
-        readAll('docs'),
-        readAll('inv')
-      ]);
-
-      // 重建内存结构
-      this.idfValues = new Map();
-      for (const row of idfRows) {
-        this.idfValues.set(row.term, row.idf);
+      // 签名完全匹配 - 直接加载
+      if (meta.signature === signature) {
+        console.log('✅ 签名匹配，开始加载索引...');
+        await this._loadIndexData(db);
+        console.log('✅ 索引加载完成');
+        return { loaded: true, canIncremental: false };
       }
 
-      this.docNorms = new Map();
-      for (const row of normRows) {
-        this.docNorms.set(row.id, row.norm);
+      // 签名不匹配 - 检查是否可以增量更新
+      const cachedBookmarkIds = meta.bookmarkIds || [];
+      const changes = this.detectBookmarkChanges(currentBookmarks, cachedBookmarkIds);
+
+      // 如果变化不超过20%，启用增量更新
+      const changeRatio = (changes.added.length + changes.removed.length) / currentBookmarks.length;
+      if (changeRatio < 0.2 && cachedBookmarkIds.length > 0) {
+        console.log(`📊 变化率: ${(changeRatio * 100).toFixed(1)}%, 可进行增量更新`);
+        await this._loadIndexData(db);
+        return {
+          loaded: false,
+          canIncremental: true,
+          added: changes.added,
+          removed: changes.removed
+        };
       }
 
-      this.bookmarkData = new Map();
-      for (const row of docRows) {
-        this.bookmarkData.set(row.id, { id: row.id, title: row.title, url: row.url });
-      }
+      console.log(`⚠️ 变化率过大 (${(changeRatio * 100).toFixed(1)}%)，需要完全重建`);
+      return { loaded: false, canIncremental: false };
 
-      this.invertedIndex = new Map();
-      for (const row of invRows) {
-        this.invertedIndex.set(row.term, row.posting);
-      }
-
-      console.log('索引加载完成');
-      return true;
     } catch (e) {
-      console.warn('加载本地索引失败，回退到重建:', e && e.message);
-      return false;
+      console.warn('❌ 加载本地索引失败，回退到重建:', e && e.message);
+      return { loaded: false, canIncremental: false };
+    }
+  }
+
+  async _loadIndexData(db) {
+    // 读取各存储
+    const readAll = async (storeName) => {
+      const tx = db.transaction(storeName, 'readonly');
+      const store = tx.objectStore(storeName);
+      const req = store.getAll();
+      const res = await this.idbReq(req);
+      return res || [];
+    };
+
+    const [idfRows, normRows, docRows, invRows] = await Promise.all([
+      readAll('idf'),
+      readAll('norms'),
+      readAll('docs'),
+      readAll('inv')
+    ]);
+
+    // 重建内存结构
+    this.idfValues = new Map();
+    for (const row of idfRows) {
+      this.idfValues.set(row.term, row.idf);
+    }
+
+    this.docNorms = new Map();
+    for (const row of normRows) {
+      this.docNorms.set(row.id, row.norm);
+    }
+
+    this.bookmarkData = new Map();
+    for (const row of docRows) {
+      this.bookmarkData.set(row.id, { id: row.id, title: row.title, url: row.url });
+    }
+
+    this.invertedIndex = new Map();
+    for (const row of invRows) {
+      this.invertedIndex.set(row.term, row.posting);
     }
   }
 
@@ -229,12 +285,14 @@ class PureVectorSearchEngine {
       await this.clearStores(db);
 
       // 批量写入
-      // meta
+      // meta（保存书签ID列表用于增量检测）
       {
+        const bookmarkIds = Array.from(this.bookmarkData.keys());
         const tx = db.transaction('meta', 'readwrite');
         await this.idbReq(tx.objectStore('meta').put({
           key: 'meta',
           signature,
+          bookmarkIds,
           createdAt: Date.now(),
           stats: {
             docCount: this.bookmarkData.size,
@@ -285,10 +343,40 @@ class PureVectorSearchEngine {
         await new Promise(resolve => { tx.oncomplete = () => resolve(); });
       }
 
-      console.log('索引已保存到本地缓存');
+      console.log('✅ 索引已保存到本地缓存');
     } catch (e) {
-      console.warn('保存索引失败（不影响搜索功能）:', e && e.message);
+      console.warn('⚠️ 保存索引失败（不影响搜索功能）:', e && e.message);
     }
+  }
+
+  // 增量更新索引
+  async incrementalUpdate(addedBookmarks, removedIds, allBookmarks) {
+    this.initProgress.status = 'incremental_update';
+    console.log(`🔄 开始增量更新: 新增 ${addedBookmarks.length}, 删除 ${removedIds.length}`);
+
+    // 1. 删除已移除的书签
+    for (const id of removedIds) {
+      this.bookmarkData.delete(id);
+      this.docNorms.delete(id);
+      // 从倒排索引中移除
+      for (const [term, posting] of this.invertedIndex.entries()) {
+        const filtered = posting.filter(p => p.id !== id);
+        if (filtered.length === 0) {
+          this.invertedIndex.delete(term);
+        } else if (filtered.length !== posting.length) {
+          this.invertedIndex.set(term, filtered);
+        }
+      }
+    }
+
+    // 2. 如果有新增书签，需要重新计算IDF
+    if (addedBookmarks.length > 0) {
+      console.log('🔄 重新计算全局IDF...');
+      // 简化处理：完全重建（因为IDF需要全局统计）
+      await this.buildVocabularyAndVectors(allBookmarks);
+    }
+
+    console.log('✅ 增量更新完成');
   }
 
   // 完全基于模型的文本预处理：纯数学方法，无预定义规则
