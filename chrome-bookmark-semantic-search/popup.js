@@ -237,8 +237,9 @@ class BookmarkSearchUI {
     const div = document.createElement('div');
     div.className = 'bookmark-item';
     
-    // 格式化相似度分数
-    const similarityPercent = Math.round(bookmark.similarity * 100);
+    // 格式化相似度分数（兼容 score 和 similarity 字段）
+    const similarity = bookmark.score || bookmark.similarity || 0;
+    const similarityPercent = Math.round(similarity * 100);
     
     div.innerHTML = `
       <div class="bookmark-title">${this.escapeHtml(bookmark.title || '无标题')}</div>

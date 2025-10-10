@@ -2,13 +2,14 @@
   "manifest_version": 3,
   "name": "智能书签搜索",
   "version": "1.0.0",
-  "description": "基于 CLIP 语义理解的智能书签搜索 - 真正理解查询意图",
+  "description": "基于 Sentence-BERT 语义理解的智能书签搜索 - 真正理解查询意图",
   
   "permissions": [
     "bookmarks",
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "offscreen"
   ],
   
   "host_permissions": [
@@ -16,8 +17,7 @@
   ],
   
   "background": {
-    "service_worker": "background_semantic.js",
-    "type": "module"
+    "service_worker": "background_offscreen.js"
   },
   
   "content_scripts": [
@@ -41,8 +41,12 @@
   
   "web_accessible_resources": [
     {
-      "resources": ["models/*"],
+      "resources": ["models/*", "offscreen.html"],
       "matches": ["<all_urls>"]
     }
-  ]
+  ],
+  
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  }
 }

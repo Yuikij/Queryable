@@ -4,7 +4,8 @@
   "description": "智能书签搜索 - 基于语义理解的Chrome扩展",
   "main": "background.js",
   "scripts": {
-    "build": "echo '无需构建，直接加载到Chrome即可'",
+    "build": "webpack --config webpack.config.js",
+    "build:watch": "webpack --config webpack.config.js --watch",
     "test": "echo '测试：在Chrome扩展页面加载插件'",
     "lint": "echo '代码检查通过'",
     "pack": "zip -r bookmark-search-extension.zip . -x '*.git*' 'node_modules/*' 'package*.json'"
@@ -43,5 +44,9 @@
       "tensorflow-js",
       "universal-sentence-encoder"
     ]
+  },
+  "devDependencies": {
+    "webpack": "^5.102.1",
+    "webpack-cli": "^6.0.1"
   }
 }

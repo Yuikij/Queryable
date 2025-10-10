@@ -1,18 +1,18 @@
-// Chrome Extension Background Script - Service Worker
-// 由于 Service Worker 限制（无法使用 URL.createObjectURL），
-// 我们将语义搜索功能委托给 Offscreen Document
+// Webpack 入口文件 - 导入 Transformers.js 并初始化语义搜索引擎
+import { pipeline, env } from '@xenova/transformers';
 
-console.log('🚀 Background Service Worker 启动');
-console.log('⚠️  注意: Service Worker 不支持 ONNX Runtime');
-console.log('💡 解决方案: 先使用 TF-IDF，或者实现 Offscreen Document');
+// 配置 Transformers.js
+env.allowLocalModels = false;
+env.useBrowserCache = true;
 
-// 暂时导入 TF-IDF 版本作为后备
-// TODO: 实现 Offscreen Document 以支持真正的语义搜索
-import('./background_pure_vector.js').then(() => {
-  console.log('✅ 已加载 TF-IDF 搜索引擎（后备方案）');
-}).catch(err => {
-  console.error('❌ 加载失败:', err);
-});
+// 将 pipeline 和 env 导出到全局作用域供 Service Worker 使用
+self.transformers = { pipeline, env };
+
+console.log('✅ Transformers.js 已通过 webpack 打包加载');
+
+// ============================================================
+// 以下是语义搜索引擎的完整实现
+// ============================================================
 
 class SemanticSearchEngine {
   constructor() {
@@ -39,41 +39,38 @@ class SemanticSearchEngine {
       console.log('🚀 开始初始化语义搜索引擎...');
       this.initProgress.status = 'loading_model';
 
-      // 1. 加载语义模型
-      // Transformers.js 已在文件顶部通过 webpack 打包导入
-      // ONNX Runtime 环境也已在顶部配置
-      console.log('📥 加载语义编码模型（Sentence-BERT）...');
+      // 加载语义模型
+      console.log('📥 加载语义编码模型...');
       
-      this.embedder = await pipeline(
+      if (!self.transformers || !self.transformers.pipeline) {
+        throw new Error('Transformers.js 未正确初始化');
+      }
+      
+      this.embedder = await self.transformers.pipeline(
         'feature-extraction',
         'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
         { 
-          quantized: true,  // 使用量化版本减小体积
-          revision: 'main',
+          quantized: true,
           progress_callback: (progress) => {
             if (progress.status === 'progress') {
-              const percent = Math.round(progress.progress || 0);
-              console.log(`模型下载进度: ${percent}%`);
-              this.initProgress.status = `downloading_model_${percent}`;
-            } else if (progress.status === 'done') {
-              console.log(`✅ 下载完成: ${progress.file}`);
+              console.log(`模型下载进度: ${Math.round(progress.progress)}%`);
             }
           }
         }
       );
       console.log('✅ 模型加载完成');
 
-      // 2. 获取所有书签
+      // 获取所有书签
       this.initProgress.status = 'loading_bookmarks';
       const bookmarks = await this.getAllBookmarks();
       this.initProgress.total = bookmarks.length;
       console.log(`📚 找到 ${bookmarks.length} 个书签`);
 
-      // 3. 计算书签签名
+      // 计算书签签名
       const signature = await this.computeBookmarksSignature(bookmarks);
       console.log(`🔑 书签签名: ${signature}`);
 
-      // 4. 尝试从缓存加载
+      // 尝试从缓存加载
       const loadResult = await this.loadEmbeddings(signature, bookmarks);
       
       if (loadResult.loaded) {
@@ -84,7 +81,7 @@ class SemanticSearchEngine {
         return true;
       }
 
-      // 5. 检查增量更新
+      // 检查增量更新
       if (loadResult.canIncremental) {
         console.log(`🔄 增量更新: 新增 ${loadResult.added.length}, 删除 ${loadResult.removed.length}`);
         await this.incrementalUpdate(loadResult.added, loadResult.removed, bookmarks);
@@ -97,7 +94,7 @@ class SemanticSearchEngine {
         return true;
       }
 
-      // 6. 完全重建索引
+      // 完全重建索引
       console.log('🔨 构建全新的语义索引...');
       this.initProgress.status = 'building_embeddings';
       await this.buildEmbeddings(bookmarks);
@@ -143,7 +140,6 @@ class SemanticSearchEngine {
     });
   }
 
-  // 获取网页内容
   async fetchPageContent(url) {
     try {
       const controller = new AbortController();
@@ -179,7 +175,7 @@ class SemanticSearchEngine {
         .replace(/\s+/g, ' ')
         .trim();
       
-      const maxLength = 512; // 限制长度以提高编码速度
+      const maxLength = 512;
       return cleanHtml.length > maxLength ? 
         cleanHtml.substring(0, maxLength) : 
         cleanHtml;
@@ -188,7 +184,6 @@ class SemanticSearchEngine {
     }
   }
 
-  // 构建语义嵌入
   async buildEmbeddings(bookmarks) {
     console.log('🔨 开始构建语义嵌入向量...');
     
@@ -196,35 +191,27 @@ class SemanticSearchEngine {
       const bookmark = bookmarks[i];
       
       try {
-        // 获取网页内容
         const pageContent = await this.fetchPageContent(bookmark.url);
-        
-        // 组合文本：标题 + 网页内容
         const text = `${bookmark.title} ${pageContent}`.trim().slice(0, 512);
         
-        // 生成语义嵌入向量
         const output = await this.embedder(text, {
           pooling: 'mean',
           normalize: true
         });
         
-        // 保存嵌入向量（转为普通数组以便存储）
         this.embeddings.set(bookmark.id, Array.from(output.data));
         
-        // 保存书签信息
         this.bookmarkData.set(bookmark.id, {
           id: bookmark.id,
           title: bookmark.title,
           url: bookmark.url
         });
         
-        // 更新进度
         this.initProgress.current = i + 1;
         if ((i + 1) % 10 === 0) {
           console.log(`📊 进度: ${i + 1}/${bookmarks.length}`);
         }
         
-        // 防止过快请求
         if (i % 5 === 0 && i > 0) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
@@ -236,7 +223,6 @@ class SemanticSearchEngine {
     console.log('✅ 语义嵌入构建完成');
   }
 
-  // 语义搜索
   async searchBookmarks(query, topK = 20) {
     if (!this.isInitialized) {
       await this.initialize();
@@ -245,14 +231,12 @@ class SemanticSearchEngine {
     try {
       console.log(`🔍 语义搜索: "${query}"`);
       
-      // 1. 编码查询文本
       const queryOutput = await this.embedder(query, {
         pooling: 'mean',
         normalize: true
       });
       const queryEmbedding = Array.from(queryOutput.data);
 
-      // 2. 计算与所有书签的相似度
       const similarities = [];
       for (const [id, bookmarkEmbedding] of this.embeddings) {
         const similarity = this.cosineSimilarity(queryEmbedding, bookmarkEmbedding);
@@ -260,7 +244,6 @@ class SemanticSearchEngine {
         similarities.push({ ...bookmark, similarity });
       }
 
-      // 3. 排序并返回 Top-K
       const results = similarities
         .sort((a, b) => b.similarity - a.similarity)
         .slice(0, topK);
@@ -278,7 +261,6 @@ class SemanticSearchEngine {
     }
   }
 
-  // 余弦相似度计算（向量已归一化，点积即相似度）
   cosineSimilarity(a, b) {
     let dot = 0;
     for (let i = 0; i < a.length; i++) {
@@ -287,8 +269,6 @@ class SemanticSearchEngine {
     return dot;
   }
 
-  // ======= 持久化相关方法 =======
-  
   async computeBookmarksSignature(bookmarks) {
     const payload = bookmarks
       .map(b => `${b.id}|${b.title}|${b.url}`)
@@ -364,14 +344,12 @@ class SemanticSearchEngine {
 
       console.log(`📋 缓存签名: ${meta.signature}, 当前签名: ${signature}`);
 
-      // 签名完全匹配 - 直接加载
       if (meta.signature === signature) {
         console.log('✅ 签名匹配，加载缓存...');
         await this._loadEmbeddingData(db);
         return { loaded: true, canIncremental: false };
       }
 
-      // 签名不匹配 - 检查是否可以增量更新
       const cachedBookmarkIds = meta.bookmarkIds || [];
       const changes = this.detectBookmarkChanges(currentBookmarks, cachedBookmarkIds);
       const changeRatio = (changes.added.length + changes.removed.length) / currentBookmarks.length;
@@ -426,7 +404,6 @@ class SemanticSearchEngine {
     try {
       const db = await this.openDatabase();
 
-      // 清空旧数据
       const clearTx = db.transaction(['embeddings', 'bookmarks'], 'readwrite');
       await Promise.all([
         this.idbReq(clearTx.objectStore('embeddings').clear()),
@@ -434,7 +411,6 @@ class SemanticSearchEngine {
       ]);
       await new Promise(resolve => { clearTx.oncomplete = () => resolve(); });
 
-      // 保存元数据
       const metaTx = db.transaction('meta', 'readwrite');
       const bookmarkIds = Array.from(this.bookmarkData.keys());
       await this.idbReq(metaTx.objectStore('meta').put({
@@ -446,7 +422,6 @@ class SemanticSearchEngine {
       }));
       await new Promise(resolve => { metaTx.oncomplete = () => resolve(); });
 
-      // 保存嵌入向量
       const embTx = db.transaction('embeddings', 'readwrite');
       const embStore = embTx.objectStore('embeddings');
       for (const [id, embedding] of this.embeddings) {
@@ -454,7 +429,6 @@ class SemanticSearchEngine {
       }
       await new Promise(resolve => { embTx.oncomplete = () => resolve(); });
 
-      // 保存书签数据
       const bookmarkTx = db.transaction('bookmarks', 'readwrite');
       const bookmarkStore = bookmarkTx.objectStore('bookmarks');
       for (const [id, bookmark] of this.bookmarkData) {
@@ -471,13 +445,11 @@ class SemanticSearchEngine {
   async incrementalUpdate(addedBookmarks, removedIds, allBookmarks) {
     console.log(`🔄 增量更新: 新增 ${addedBookmarks.length}, 删除 ${removedIds.length}`);
 
-    // 删除已移除的书签
     for (const id of removedIds) {
       this.embeddings.delete(id);
       this.bookmarkData.delete(id);
     }
 
-    // 添加新书签
     for (const bookmark of addedBookmarks) {
       try {
         const pageContent = await this.fetchPageContent(bookmark.url);
@@ -559,4 +531,5 @@ chrome.runtime.onStartup.addListener(() => {
   searchEngine.initialize().catch(console.error);
 });
 
-console.log('✅ 语义搜索引擎已加载');
+console.log('✅ 语义搜索引擎已加载（webpack 打包版本）');
+
