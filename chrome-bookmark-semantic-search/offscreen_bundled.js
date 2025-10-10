@@ -24849,6 +24849,20 @@ async function loadItems(mapping, model, pretrainedOptions) {
 console.log('🚀 Offscreen Document 启动');
 console.log('✅ 完整 DOM 环境可用');
 
+// ⚠️ 重要：配置 ONNX Runtime 环境
+// 在 Chrome Extension 中，即使 Offscreen Document 也不能使用多线程
+
+
+// 禁用 Web Workers 和多线程
+ort_web_min.env.wasm.numThreads = 1;
+ort_web_min.env.wasm.simd = true;  // SIMD 可以用
+ort_web_min.env.wasm.proxy = false; // 不使用 Worker proxy
+
+console.log('⚙️ ONNX Runtime 配置:');
+console.log('  - numThreads:', ort_web_min.env.wasm.numThreads);
+console.log('  - simd:', ort_web_min.env.wasm.simd);
+console.log('  - proxy:', ort_web_min.env.wasm.proxy);
+
 // 配置 Transformers.js 环境
 env.allowLocalModels = false;
 env.useBrowserCache = true;
